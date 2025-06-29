@@ -30,14 +30,11 @@ const VideoEditor = () => {
   const [exportStatus, setExportStatus] = useState('');
   const [trimSegments, setTrimSegments] = useState<{start: number, end: number}[]>([]);
   const [cutPoints, setCutPoints] = useState<number[]>([]);
-  const [isRecording, setIsRecording] = useState(false);
-  const [recordedUrl, setRecordedUrl] = useState<string | null>(null);
   const [isFfmpegLoading, setIsFfmpegLoading] = useState(false);
   const [ffmpeg, setFfmpeg] = useState<any>(null);
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
   const previewContainerRef = useRef<HTMLDivElement>(null);
 
   // Get current active zoom effect
@@ -176,18 +173,18 @@ const VideoEditor = () => {
     setCutPoints(prev => [...prev, cutTime]);
   };
 
-  // Load ffmpeg.wasm with ultra-fast settings
+  // Load FFmpeg with proper error handling
   const loadFfmpeg = async () => {
     if (!ffmpeg) {
       setIsFfmpegLoading(true);
-      setExportStatus('Loading video processor...');
+      setExportStatus('Loading FFmpeg...');
       try {
         const { FFmpeg } = await import('@ffmpeg/ffmpeg');
         const { fetchFile, toBlobURL } = await import('@ffmpeg/util');
         
         const ffmpegInstance = new FFmpeg();
         
-        // Use CDN URLs for faster loading
+        // Use stable CDN URLs
         const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd';
         
         await ffmpegInstance.load({
@@ -202,105 +199,13 @@ const VideoEditor = () => {
       } catch (error) {
         console.error('Failed to load FFmpeg:', error);
         setIsFfmpegLoading(false);
-        setExportStatus('Failed to load processor');
+        setExportStatus('Failed to load FFmpeg');
         throw error;
       }
     }
     return ffmpeg;
   };
 
-  // Canvas-based export for zoom effects (much faster than FFmpeg for simple operations)
-  const exportWithCanvas = async () => {
-    if (!videoRef.current || !canvasRef.current) return null;
-
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return null;
-
-    // Set canvas size to video size
-    canvas.width = video.videoWidth || 1920;
-    canvas.height = video.videoHeight || 1080;
-
-    const chunks: Blob[] = [];
-    const stream = canvas.captureStream(30); // 30 FPS
-    const mediaRecorder = new MediaRecorder(stream, {
-      mimeType: 'video/webm;codecs=vp9',
-      videoBitsPerSecond: 5000000 // 5 Mbps
-    });
-
-    mediaRecorder.ondataavailable = (event) => {
-      if (event.data.size > 0) {
-        chunks.push(event.data);
-      }
-    };
-
-    return new Promise<Blob>((resolve, reject) => {
-      mediaRecorder.onstop = () => {
-        const blob = new Blob(chunks, { type: 'video/webm' });
-        resolve(blob);
-      };
-
-      mediaRecorder.onerror = reject;
-
-      // Start recording
-      mediaRecorder.start();
-
-      // Render frames
-      let frameCount = 0;
-      const fps = 30;
-      const totalFrames = Math.floor(duration * fps);
-
-      const renderFrame = () => {
-        const currentVideoTime = frameCount / fps;
-        
-        if (currentVideoTime >= duration) {
-          mediaRecorder.stop();
-          return;
-        }
-
-        // Update progress
-        setExportProgress(Math.round((frameCount / totalFrames) * 100));
-
-        // Seek video to current time
-        video.currentTime = currentVideoTime;
-
-        video.onseeked = () => {
-          // Clear canvas
-          ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-          // Find active zoom effect
-          const activeZoom = zoomEffects.find(effect => 
-            currentVideoTime >= effect.startTime && currentVideoTime <= effect.endTime
-          );
-
-          if (activeZoom) {
-            // Apply zoom transformation
-            const scale = activeZoom.zoomLevel / 100;
-            const centerX = (activeZoom.position.x / 100) * canvas.width;
-            const centerY = (activeZoom.position.y / 100) * canvas.height;
-
-            ctx.save();
-            ctx.translate(centerX, centerY);
-            ctx.scale(scale, scale);
-            ctx.translate(-centerX, -centerY);
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            ctx.restore();
-          } else {
-            // No zoom, draw normally
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          }
-
-          frameCount++;
-          setTimeout(renderFrame, 1000 / fps);
-        };
-      };
-
-      renderFrame();
-    });
-  };
-
-  // Ultra-fast export with smart optimization
   const handleExport = async () => {
     if (!videoRef.current || !videoFile) {
       alert('Please import a video first');
@@ -309,128 +214,100 @@ const VideoEditor = () => {
 
     setIsExporting(true);
     setExportProgress(0);
-    setExportStatus('Analyzing video...');
+    setExportStatus('Initializing export...');
 
     try {
-      const hasZoomEffects = zoomEffects.length > 0;
-      const hasTrimSegments = trimSegments.length > 0;
-      const hasComplexEdits = hasZoomEffects || hasTrimSegments;
-
-      // Strategy 1: No edits - instant copy
-      if (!hasComplexEdits) {
-        setExportStatus('No edits detected - copying original file...');
-        setExportProgress(50);
-        
-        const response = await fetch(videoFile);
-        const blob = await response.blob();
-        
-        setExportProgress(100);
-        downloadBlob(blob, `copy_${videoFileName}`);
-        
-        setTimeout(() => {
-          setIsExporting(false);
-          setExportProgress(0);
-          setExportStatus('');
-        }, 1000);
-        return;
-      }
-
-      // Strategy 2: Only zoom effects - use canvas recording (fastest)
-      if (hasZoomEffects && !hasTrimSegments) {
-        setExportStatus('Rendering zoom effects with canvas...');
-        
-        const blob = await exportWithCanvas();
-        if (blob) {
-          downloadBlob(blob, `zoomed_${videoFileName.replace(/\.[^/.]+$/, '')}.webm`);
-          
-          setTimeout(() => {
-            setIsExporting(false);
-            setExportProgress(0);
-            setExportStatus('');
-          }, 1000);
-          return;
-        }
-      }
-
-      // Strategy 3: FFmpeg for complex operations (slower but necessary)
-      setExportStatus('Loading video processor...');
       const { fetchFile } = await import('@ffmpeg/util');
       const ffmpegInstance = await loadFfmpeg();
 
-      // Enhanced progress tracking
-      let lastProgress = 0;
+      // Set up progress tracking
       ffmpegInstance.on('progress', ({ progress }: { progress: number }) => {
         const currentProgress = Math.round(progress * 100);
-        if (currentProgress > lastProgress) {
-          lastProgress = currentProgress;
-          setExportProgress(currentProgress);
-          setExportStatus(`Processing... ${currentProgress}%`);
-        }
+        setExportProgress(currentProgress);
+        setExportStatus(`Processing video... ${currentProgress}%`);
       });
 
       setExportStatus('Loading video file...');
       setExportProgress(5);
 
+      // Load the video file
       const response = await fetch(videoFile);
-      const data = await response.blob();
-      const fileName = videoFileName || 'input.mp4';
+      const videoBlob = await response.blob();
+      const inputFileName = 'input.mp4';
       
-      await ffmpegInstance.writeFile(fileName, await fetchFile(data));
+      await ffmpegInstance.writeFile(inputFileName, await fetchFile(videoBlob));
       setExportProgress(10);
 
-      let outputName = 'output.mp4';
+      const hasZoomEffects = zoomEffects.length > 0;
+      const hasTrimSegments = trimSegments.length > 0;
+      const outputFileName = 'output.mp4';
+
       let ffmpegArgs: string[] = [];
 
-      if (hasTrimSegments && !hasZoomEffects) {
+      if (!hasZoomEffects && !hasTrimSegments) {
+        // No edits - just copy
+        setExportStatus('No edits detected - copying file...');
+        ffmpegArgs = [
+          '-i', inputFileName,
+          '-c', 'copy',
+          outputFileName
+        ];
+      } else if (!hasZoomEffects && hasTrimSegments) {
+        // Only trim operations
         setExportStatus('Applying trim operations...');
         
         if (trimSegments.length === 1) {
           const { start, end } = trimSegments[0];
           ffmpegArgs = [
-            '-ss', String(start),
-            '-i', fileName,
-            '-t', String(end - start),
+            '-ss', start.toString(),
+            '-i', inputFileName,
+            '-t', (end - start).toString(),
             '-c', 'copy',
             '-avoid_negative_ts', 'make_zero',
-            outputName
+            outputFileName
           ];
         } else {
-          // Multiple segments
+          // Multiple trim segments - concatenate
           const segmentFiles: string[] = [];
+          
           for (let i = 0; i < trimSegments.length; i++) {
             const { start, end } = trimSegments[i];
-            const segName = `seg${i}.mp4`;
+            const segmentName = `segment_${i}.mp4`;
             
             await ffmpegInstance.exec([
-              '-ss', String(start),
-              '-i', fileName,
-              '-t', String(end - start),
+              '-ss', start.toString(),
+              '-i', inputFileName,
+              '-t', (end - start).toString(),
               '-c', 'copy',
               '-avoid_negative_ts', 'make_zero',
-              segName
+              segmentName
             ]);
             
-            segmentFiles.push(segName);
+            segmentFiles.push(segmentName);
           }
 
-          const concatList = segmentFiles.map(f => `file '${f}'`).join('\n');
-          await ffmpegInstance.writeFile('concatlist.txt', concatList);
+          // Create concat file
+          const concatContent = segmentFiles.map(f => `file '${f}'`).join('\n');
+          await ffmpegInstance.writeFile('concat.txt', concatContent);
           
           ffmpegArgs = [
             '-f', 'concat',
             '-safe', '0',
-            '-i', 'concatlist.txt',
+            '-i', 'concat.txt',
             '-c', 'copy',
-            outputName
+            outputFileName
           ];
         }
-      } else if (hasZoomEffects) {
+      } else {
+        // Zoom effects (with or without trim)
         setExportStatus('Processing zoom effects...');
         
+        // Sort zoom effects by start time
         const sortedZooms = [...zoomEffects].sort((a, b) => a.startTime - b.startTime);
         
-        let filterParts = [];
-        let concatInputs = [];
+        // Build filter complex for zoom effects
+        const filterParts: string[] = [];
+        const concatInputs: string[] = [];
         
         for (let i = 0; i < sortedZooms.length; i++) {
           const effect = sortedZooms[i];
@@ -445,9 +322,9 @@ const VideoEditor = () => {
           
           const segmentDuration = (nextEffect ? nextEffect.startTime : effect.endTime) - effect.startTime;
           
-          // Optimized filter for speed
+          // Create zoom filter
           if (segmentDuration > 0.1 && (Math.abs(zoomStart - zoomEnd) > 0.01 || Math.abs(posXStart - posXEnd) > 1 || Math.abs(posYStart - posYEnd) > 1)) {
-            // Animated zoom
+            // Animated zoom with smooth transitions
             const zoomExpr = `${zoomStart}+(${zoomEnd}-${zoomStart})*(t/${segmentDuration})`;
             const outW = `iw/(${zoomExpr})`;
             const outH = `ih/(${zoomExpr})`;
@@ -458,7 +335,7 @@ const VideoEditor = () => {
               `[0:v]trim=start=${effect.startTime}:end=${effect.endTime},setpts=PTS-STARTPTS,crop=${outW}:${outH}:${xExpr}:${yExpr},scale=iw:ih[v${i}]`
             );
           } else {
-            // Static zoom - much faster
+            // Static zoom - much simpler and faster
             const outW = `iw/${zoomStart}`;
             const outH = `ih/${zoomStart}`;
             const xExpr = `(iw-${outW})*${posXStart}/100`;
@@ -472,17 +349,19 @@ const VideoEditor = () => {
           concatInputs.push(`[v${i}]`);
         }
         
+        // Add concat filter
         filterParts.push(`${concatInputs.join('')}concat=n=${sortedZooms.length}:v=1:a=0[outv]`);
         
+        // Build FFmpeg command
         if (hasTrimSegments && trimSegments.length > 0) {
           const { start, end } = trimSegments[0];
           ffmpegArgs = [
-            '-ss', String(start),
-            '-i', fileName,
-            '-t', String(end - start)
+            '-ss', start.toString(),
+            '-i', inputFileName,
+            '-t', (end - start).toString()
           ];
         } else {
-          ffmpegArgs = ['-i', fileName];
+          ffmpegArgs = ['-i', inputFileName];
         }
         
         ffmpegArgs.push(
@@ -490,23 +369,22 @@ const VideoEditor = () => {
           '-map', '[outv]',
           '-map', '0:a?',
           '-c:v', 'libx264',
-          '-preset', 'ultrafast',
-          '-crf', '30', // Lower quality for speed
-          '-tune', 'fastdecode',
+          '-preset', 'medium',
+          '-crf', '23',
           '-c:a', 'aac',
-          '-b:a', '96k', // Lower audio bitrate
+          '-b:a', '128k',
           '-movflags', '+faststart',
-          outputName
+          outputFileName
         );
       }
 
-      setExportStatus('Executing video processing...');
+      setExportStatus('Executing FFmpeg...');
       console.log('FFmpeg command:', ffmpegArgs.join(' '));
       
-      // Execute with shorter timeout
+      // Execute FFmpeg with timeout
       const exportPromise = ffmpegInstance.exec(ffmpegArgs);
       const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('Export timed out after 2 minutes')), 120000);
+        setTimeout(() => reject(new Error('Export timed out after 5 minutes')), 300000);
       });
 
       await Promise.race([exportPromise, timeoutPromise]);
@@ -514,36 +392,36 @@ const VideoEditor = () => {
       setExportStatus('Finalizing export...');
       setExportProgress(95);
 
-      const output = await ffmpegInstance.readFile(outputName);
-      const outputBlob = new Blob([output], { type: 'video/mp4' });
+      // Read the output file
+      const outputData = await ffmpegInstance.readFile(outputFileName);
+      const outputBlob = new Blob([outputData], { type: 'video/mp4' });
+      
+      // Download the file
+      const url = URL.createObjectURL(outputBlob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `edited_${videoFileName.replace(/\.[^/.]+$/, '')}.mp4`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
       
       setExportProgress(100);
-      downloadBlob(outputBlob, `edited_${fileName.replace(/\.[^/.]+$/, '')}.mp4`);
+      setExportStatus('Export completed successfully!');
       
       setTimeout(() => {
         setIsExporting(false);
         setExportProgress(0);
         setExportStatus('');
-      }, 1000);
+      }, 2000);
       
     } catch (error: any) {
       console.error('Export failed:', error);
-      alert(`Export failed: ${error.message || 'Unknown error'}`);
+      alert(`Export failed: ${error.message || 'Unknown error occurred'}`);
       setIsExporting(false);
       setExportProgress(0);
-      setExportStatus('');
+      setExportStatus('Export failed');
     }
-  };
-
-  const downloadBlob = (blob: Blob, filename: string) => {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
   };
 
   const formatTime = (time: number) => {
@@ -576,11 +454,11 @@ const VideoEditor = () => {
           <Button
             variant="outline"
             onClick={handleExport}
-            disabled={!videoFile || isRecording || isExporting}
+            disabled={!videoFile || isExporting || isFfmpegLoading}
             className="bg-purple-600 border-purple-500 hover:bg-purple-700"
           >
             <Download className="w-4 h-4 mr-2" />
-            {isExporting ? `${exportProgress}%` : 'Export'}
+            {isExporting ? `${exportProgress}%` : 'Export MP4'}
           </Button>
         </div>
       </div>
@@ -631,22 +509,22 @@ const VideoEditor = () => {
             </Card>
           )}
 
-          {/* Export Strategy Info */}
+          {/* Export Info */}
           {videoFile && (
-            <Card className="m-4 p-3 bg-green-900/30 border-green-600">
-              <h4 className="text-xs font-medium mb-2 text-green-300">Export Strategy</h4>
-              <div className="text-xs text-green-200 space-y-1">
+            <Card className="m-4 p-3 bg-blue-900/30 border-blue-600">
+              <h4 className="text-xs font-medium mb-2 text-blue-300">Export Info</h4>
+              <div className="text-xs text-blue-200 space-y-1">
+                <div>• Output format: MP4 (H.264)</div>
+                <div>• Audio: AAC 128kbps</div>
+                <div>• Quality: High (CRF 23)</div>
                 {zoomEffects.length === 0 && trimSegments.length === 0 && (
-                  <div>✓ Instant copy (no processing needed)</div>
+                  <div>• Mode: Fast copy (no re-encoding)</div>
                 )}
-                {zoomEffects.length > 0 && trimSegments.length === 0 && (
-                  <div>⚡ Canvas rendering (fast zoom effects)</div>
+                {zoomEffects.length > 0 && (
+                  <div>• Mode: Zoom processing required</div>
                 )}
                 {trimSegments.length > 0 && zoomEffects.length === 0 && (
-                  <div>🚀 Stream copy (fast trim/cut)</div>
-                )}
-                {zoomEffects.length > 0 && trimSegments.length > 0 && (
-                  <div>⚙️ Full processing (slower but complete)</div>
+                  <div>• Mode: Fast trim (stream copy)</div>
                 )}
               </div>
             </Card>
@@ -682,12 +560,12 @@ const VideoEditor = () => {
                   onPause={() => setIsPlaying(false)}
                 />
                 {/* Processing overlay */}
-                {(isExporting || isRecording || isFfmpegLoading) && (
+                {(isExporting || isFfmpegLoading) && (
                   <div className="absolute inset-0 bg-black/70 flex items-center justify-center">
                     <div className="text-white text-center">
                       <div className="animate-spin w-8 h-8 border-2 border-purple-500 border-t-transparent rounded-full mx-auto mb-2"></div>
                       <p className="text-lg mb-1">
-                        {isFfmpegLoading ? 'Loading processor...' : 
+                        {isFfmpegLoading ? 'Loading FFmpeg...' : 
                          isExporting ? `Exporting ${exportProgress}%` : 
                          'Processing...'}
                       </p>
@@ -782,14 +660,6 @@ const VideoEditor = () => {
           )}
         </div>
       </div>
-
-      {/* Hidden canvas for fast export processing */}
-      <canvas 
-        ref={canvasRef} 
-        style={{ display: 'none' }}
-        width={1920}
-        height={1080}
-      />
 
       <input
         ref={fileInputRef}
