@@ -173,7 +173,7 @@ const VideoEditor = () => {
     setCutPoints(prev => [...prev, cutTime]);
   };
 
-  // Load FFmpeg with proper error handling
+  // Load FFmpeg with proper error handling and stable URLs
   const loadFfmpeg = async () => {
     if (!ffmpeg) {
       setIsFfmpegLoading(true);
@@ -184,8 +184,8 @@ const VideoEditor = () => {
         
         const ffmpegInstance = new FFmpeg();
         
-        // Use stable CDN URLs
-        const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd';
+        // Use jsdelivr CDN for better reliability
+        const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd';
         
         await ffmpegInstance.load({
           coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
@@ -194,7 +194,7 @@ const VideoEditor = () => {
         
         setFfmpeg(ffmpegInstance);
         setIsFfmpegLoading(false);
-        setExportStatus('');
+        setExportStatus('FFmpeg loaded successfully');
         return ffmpegInstance;
       } catch (error) {
         console.error('Failed to load FFmpeg:', error);
@@ -214,17 +214,29 @@ const VideoEditor = () => {
 
     setIsExporting(true);
     setExportProgress(0);
-    setExportStatus('Initializing export...');
+    setExportStatus('Starting export...');
 
     try {
       const { fetchFile } = await import('@ffmpeg/util');
       const ffmpegInstance = await loadFfmpeg();
 
+      // Clear any previous files
+      try {
+        const files = ffmpegInstance.listDir('/');
+        for (const file of files) {
+          if (file.name.endsWith('.mp4') || file.name.endsWith('.txt')) {
+            ffmpegInstance.deleteFile(file.name);
+          }
+        }
+      } catch (e) {
+        // Ignore cleanup errors
+      }
+
       // Set up progress tracking
       ffmpegInstance.on('progress', ({ progress }: { progress: number }) => {
         const currentProgress = Math.round(progress * 100);
-        setExportProgress(currentProgress);
-        setExportStatus(`Processing video... ${currentProgress}%`);
+        setExportProgress(Math.min(currentProgress, 95));
+        setExportStatus(`Processing video... ${Math.min(currentProgress, 95)}%`);
       });
 
       setExportStatus('Loading video file...');
@@ -245,11 +257,15 @@ const VideoEditor = () => {
       let ffmpegArgs: string[] = [];
 
       if (!hasZoomEffects && !hasTrimSegments) {
-        // No edits - just copy
-        setExportStatus('No edits detected - copying file...');
+        // No edits - just copy with proper MP4 format
+        setExportStatus('No edits detected - optimizing format...');
         ffmpegArgs = [
           '-i', inputFileName,
-          '-c', 'copy',
+          '-c:v', 'libx264',
+          '-c:a', 'aac',
+          '-preset', 'fast',
+          '-crf', '23',
+          '-movflags', '+faststart',
           outputFileName
         ];
       } else if (!hasZoomEffects && hasTrimSegments) {
@@ -259,10 +275,14 @@ const VideoEditor = () => {
         if (trimSegments.length === 1) {
           const { start, end } = trimSegments[0];
           ffmpegArgs = [
-            '-ss', start.toString(),
+            '-ss', start.toFixed(3),
             '-i', inputFileName,
-            '-t', (end - start).toString(),
-            '-c', 'copy',
+            '-t', (end - start).toFixed(3),
+            '-c:v', 'libx264',
+            '-c:a', 'aac',
+            '-preset', 'fast',
+            '-crf', '23',
+            '-movflags', '+faststart',
             '-avoid_negative_ts', 'make_zero',
             outputFileName
           ];
@@ -275,10 +295,13 @@ const VideoEditor = () => {
             const segmentName = `segment_${i}.mp4`;
             
             await ffmpegInstance.exec([
-              '-ss', start.toString(),
+              '-ss', start.toFixed(3),
               '-i', inputFileName,
-              '-t', (end - start).toString(),
-              '-c', 'copy',
+              '-t', (end - start).toFixed(3),
+              '-c:v', 'libx264',
+              '-c:a', 'aac',
+              '-preset', 'fast',
+              '-crf', '23',
               '-avoid_negative_ts', 'make_zero',
               segmentName
             ]);
@@ -294,7 +317,11 @@ const VideoEditor = () => {
             '-f', 'concat',
             '-safe', '0',
             '-i', 'concat.txt',
-            '-c', 'copy',
+            '-c:v', 'libx264',
+            '-c:a', 'aac',
+            '-preset', 'fast',
+            '-crf', '23',
+            '-movflags', '+faststart',
             outputFileName
           ];
         }
@@ -313,38 +340,20 @@ const VideoEditor = () => {
           const effect = sortedZooms[i];
           const nextEffect = sortedZooms[i + 1];
           
-          const zoomStart = effect.zoomLevel / 100;
-          const zoomEnd = nextEffect ? nextEffect.zoomLevel / 100 : zoomStart;
-          const posXStart = effect.position.x;
-          const posXEnd = nextEffect ? nextEffect.position.x : posXStart;
-          const posYStart = effect.position.y;
-          const posYEnd = nextEffect ? nextEffect.position.y : posYStart;
+          const zoomLevel = effect.zoomLevel / 100;
+          const posX = effect.position.x;
+          const posY = effect.position.y;
           
-          const segmentDuration = (nextEffect ? nextEffect.startTime : effect.endTime) - effect.startTime;
+          // Calculate crop dimensions
+          const outW = `iw/${zoomLevel}`;
+          const outH = `ih/${zoomLevel}`;
+          const xPos = `(iw-${outW})*${posX}/100`;
+          const yPos = `(ih-${outH})*${posY}/100`;
           
-          // Create zoom filter
-          if (segmentDuration > 0.1 && (Math.abs(zoomStart - zoomEnd) > 0.01 || Math.abs(posXStart - posXEnd) > 1 || Math.abs(posYStart - posYEnd) > 1)) {
-            // Animated zoom with smooth transitions
-            const zoomExpr = `${zoomStart}+(${zoomEnd}-${zoomStart})*(t/${segmentDuration})`;
-            const outW = `iw/(${zoomExpr})`;
-            const outH = `ih/(${zoomExpr})`;
-            const xExpr = `(iw-${outW})*(${posXStart}+(${posXEnd}-${posXStart})*(t/${segmentDuration}))/100`;
-            const yExpr = `(ih-${outH})*(${posYStart}+(${posYEnd}-${posYStart})*(t/${segmentDuration}))/100`;
-            
-            filterParts.push(
-              `[0:v]trim=start=${effect.startTime}:end=${effect.endTime},setpts=PTS-STARTPTS,crop=${outW}:${outH}:${xExpr}:${yExpr},scale=iw:ih[v${i}]`
-            );
-          } else {
-            // Static zoom - much simpler and faster
-            const outW = `iw/${zoomStart}`;
-            const outH = `ih/${zoomStart}`;
-            const xExpr = `(iw-${outW})*${posXStart}/100`;
-            const yExpr = `(ih-${outH})*${posYStart}/100`;
-            
-            filterParts.push(
-              `[0:v]trim=start=${effect.startTime}:end=${effect.endTime},setpts=PTS-STARTPTS,crop=${outW}:${outH}:${xExpr}:${yExpr},scale=iw:ih[v${i}]`
-            );
-          }
+          // Create filter for this segment
+          filterParts.push(
+            `[0:v]trim=start=${effect.startTime.toFixed(3)}:end=${effect.endTime.toFixed(3)},setpts=PTS-STARTPTS,crop=${outW}:${outH}:${xPos}:${yPos},scale=iw:ih[v${i}]`
+          );
           
           concatInputs.push(`[v${i}]`);
         }
@@ -356,9 +365,9 @@ const VideoEditor = () => {
         if (hasTrimSegments && trimSegments.length > 0) {
           const { start, end } = trimSegments[0];
           ffmpegArgs = [
-            '-ss', start.toString(),
+            '-ss', start.toFixed(3),
             '-i', inputFileName,
-            '-t', (end - start).toString()
+            '-t', (end - start).toFixed(3)
           ];
         } else {
           ffmpegArgs = ['-i', inputFileName];
@@ -369,11 +378,12 @@ const VideoEditor = () => {
           '-map', '[outv]',
           '-map', '0:a?',
           '-c:v', 'libx264',
-          '-preset', 'medium',
+          '-preset', 'fast',
           '-crf', '23',
           '-c:a', 'aac',
           '-b:a', '128k',
           '-movflags', '+faststart',
+          '-avoid_negative_ts', 'make_zero',
           outputFileName
         );
       }
@@ -392,9 +402,27 @@ const VideoEditor = () => {
       setExportStatus('Finalizing export...');
       setExportProgress(95);
 
+      // Check if output file exists
+      const files = ffmpegInstance.listDir('/');
+      const outputExists = files.some(f => f.name === outputFileName);
+      
+      if (!outputExists) {
+        throw new Error('Output file was not created. Check your edits and try again.');
+      }
+
       // Read the output file
       const outputData = await ffmpegInstance.readFile(outputFileName);
+      
+      if (!outputData || outputData.length === 0) {
+        throw new Error('Output file is empty. Export failed.');
+      }
+      
       const outputBlob = new Blob([outputData], { type: 'video/mp4' });
+      
+      // Verify the blob is valid
+      if (outputBlob.size === 0) {
+        throw new Error('Generated video file is empty.');
+      }
       
       // Download the file
       const url = URL.createObjectURL(outputBlob);
@@ -413,11 +441,11 @@ const VideoEditor = () => {
         setIsExporting(false);
         setExportProgress(0);
         setExportStatus('');
-      }, 2000);
+      }, 3000);
       
     } catch (error: any) {
       console.error('Export failed:', error);
-      alert(`Export failed: ${error.message || 'Unknown error occurred'}`);
+      alert(`Export failed: ${error.message || 'Unknown error occurred'}\n\nPlease try:\n1. Using a shorter video\n2. Reducing zoom effects\n3. Refreshing the page and trying again`);
       setIsExporting(false);
       setExportProgress(0);
       setExportStatus('Export failed');
@@ -512,19 +540,20 @@ const VideoEditor = () => {
           {/* Export Info */}
           {videoFile && (
             <Card className="m-4 p-3 bg-blue-900/30 border-blue-600">
-              <h4 className="text-xs font-medium mb-2 text-blue-300">Export Info</h4>
+              <h4 className="text-xs font-medium mb-2 text-blue-300">Export Settings</h4>
               <div className="text-xs text-blue-200 space-y-1">
-                <div>• Output format: MP4 (H.264)</div>
-                <div>• Audio: AAC 128kbps</div>
+                <div>• Format: MP4 (H.264 + AAC)</div>
                 <div>• Quality: High (CRF 23)</div>
+                <div>• Audio: AAC 128kbps</div>
+                <div>• Optimization: Fast start enabled</div>
                 {zoomEffects.length === 0 && trimSegments.length === 0 && (
-                  <div>• Mode: Fast copy (no re-encoding)</div>
+                  <div>• Mode: Format optimization</div>
                 )}
                 {zoomEffects.length > 0 && (
-                  <div>• Mode: Zoom processing required</div>
+                  <div>• Mode: Zoom processing active</div>
                 )}
                 {trimSegments.length > 0 && zoomEffects.length === 0 && (
-                  <div>• Mode: Fast trim (stream copy)</div>
+                  <div>• Mode: Trim processing</div>
                 )}
               </div>
             </Card>
