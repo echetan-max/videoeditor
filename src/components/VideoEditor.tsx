@@ -35,6 +35,7 @@ const VideoEditor = () => {
   const [isFFmpegLoading, setIsFFmpegLoading] = useState(false);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [exportFormat, setExportFormat] = useState<'mp4' | 'webm'>('webm');
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -184,7 +185,7 @@ const VideoEditor = () => {
     setCutPoints(prev => [...prev, cutTime]);
   };
 
-  // FIXED: Simplified FFmpeg loading with correct CDN
+  // FIXED: Multiple CDN fallbacks for FFmpeg loading
   const loadFFmpeg = async () => {
     if (ffmpeg) return ffmpeg;
     
@@ -192,54 +193,62 @@ const VideoEditor = () => {
     setExportStatus('🔄 Loading FFmpeg.wasm...');
     setExportProgress(5);
     
-    try {
-      console.log('🚀 Starting FFmpeg.wasm load...');
-      
-      // Import FFmpeg modules
-      const { FFmpeg } = await import('@ffmpeg/ffmpeg');
-      const { fetchFile, toBlobURL } = await import('@ffmpeg/util');
-      
-      const ffmpegInstance = new FFmpeg();
-      
-      // Set up logging
-      ffmpegInstance.on('log', ({ message }) => {
-        console.log('[FFmpeg]', message);
-      });
-      
-      // Set up progress tracking
-      ffmpegInstance.on('progress', ({ progress }) => {
-        const adjustedProgress = 30 + (progress * 60); // 30-90% range for processing
-        setExportProgress(Math.min(adjustedProgress, 90));
-        setExportStatus(`🎬 Processing video... ${Math.round(adjustedProgress)}%`);
-      });
-      
-      setExportStatus('📦 Loading FFmpeg core files...');
-      setExportProgress(15);
-      
-      // FIXED: Use working CDN URLs
-      const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
-      
-      console.log('📥 Loading core files from:', baseURL);
-      
-      await ffmpegInstance.load({
-        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-      });
-      
-      setFfmpeg(ffmpegInstance);
-      setIsFFmpegLoading(false);
-      setExportStatus('✅ FFmpeg loaded successfully!');
-      setExportProgress(25);
-      
-      console.log('✅ FFmpeg.wasm loaded successfully');
-      return ffmpegInstance;
-      
-    } catch (error) {
-      console.error('❌ Failed to load FFmpeg:', error);
-      setIsFFmpegLoading(false);
-      setExportError(`Failed to load video processor: ${error}`);
-      setExportStatus('❌ Failed to load FFmpeg');
-      throw error;
+    const cdnUrls = [
+      'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd',
+      'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd',
+      'https://unpkg.com/@ffmpeg/core@0.12.4/dist/umd',
+      'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.4/dist/umd'
+    ];
+    
+    for (let i = 0; i < cdnUrls.length; i++) {
+      try {
+        const baseURL = cdnUrls[i];
+        console.log(`🚀 Trying CDN ${i + 1}/${cdnUrls.length}: ${baseURL}`);
+        setExportStatus(`📦 Loading from CDN ${i + 1}/${cdnUrls.length}...`);
+        
+        // Import FFmpeg modules
+        const { FFmpeg } = await import('@ffmpeg/ffmpeg');
+        const { fetchFile, toBlobURL } = await import('@ffmpeg/util');
+        
+        const ffmpegInstance = new FFmpeg();
+        
+        // Set up logging
+        ffmpegInstance.on('log', ({ message }) => {
+          console.log('[FFmpeg]', message);
+        });
+        
+        // Set up progress tracking
+        ffmpegInstance.on('progress', ({ progress }) => {
+          const adjustedProgress = 30 + (progress * 60); // 30-90% range for processing
+          setExportProgress(Math.min(adjustedProgress, 90));
+          setExportStatus(`🎬 Processing video... ${Math.round(adjustedProgress)}%`);
+        });
+        
+        setExportProgress(10 + (i * 5));
+        
+        // Try to load from this CDN
+        await ffmpegInstance.load({
+          coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+          wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+        });
+        
+        setFfmpeg(ffmpegInstance);
+        setIsFFmpegLoading(false);
+        setExportStatus('✅ FFmpeg loaded successfully!');
+        setExportProgress(25);
+        
+        console.log('✅ FFmpeg.wasm loaded successfully from:', baseURL);
+        return ffmpegInstance;
+        
+      } catch (error) {
+        console.warn(`❌ CDN ${i + 1} failed:`, error);
+        if (i === cdnUrls.length - 1) {
+          // All CDNs failed
+          throw new Error(`All CDNs failed. Last error: ${error}`);
+        }
+        // Try next CDN
+        continue;
+      }
     }
   };
 
@@ -289,7 +298,7 @@ const VideoEditor = () => {
     }
   };
 
-  // FIXED: Simplified export function
+  // FIXED: Simplified export with WebM support
   const handleExport = async () => {
     if (!originalVideoFile) {
       alert('Please import a video file first');
@@ -318,45 +327,91 @@ const VideoEditor = () => {
       setExportStatus('⚙️ Building export command...');
       setExportProgress(35);
       
-      // SIMPLIFIED: Basic export command that always works
+      // Build FFmpeg command based on format
       let ffmpegArgs = ['-i', inputFileName];
-      let outputFileName = 'output.mp4';
+      let outputFileName = '';
+      let mimeType = '';
       
-      // Handle trimming (simple case)
-      if (trimSegments.length > 0) {
-        const { start, end } = trimSegments[0];
-        ffmpegArgs.push('-ss', start.toString(), '-to', end.toString());
-      }
-      
-      // Handle zoom effects (simplified)
-      if (zoomEffects.length > 0) {
-        const firstZoom = zoomEffects[0];
-        const scale = firstZoom.zoomLevel / 100;
-        const cropW = `iw/${scale}`;
-        const cropH = `ih/${scale}`;
-        const cropX = `(iw-${cropW})*${firstZoom.position.x}/100`;
-        const cropY = `(ih-${cropH})*${firstZoom.position.y}/100`;
+      if (exportFormat === 'webm') {
+        outputFileName = 'output.webm';
+        mimeType = 'video/webm';
         
+        // Handle trimming
+        if (trimSegments.length > 0) {
+          const { start, end } = trimSegments[0];
+          ffmpegArgs.push('-ss', start.toString(), '-to', end.toString());
+        }
+        
+        // Handle zoom effects (simplified for WebM)
+        if (zoomEffects.length > 0) {
+          const firstZoom = zoomEffects[0];
+          const scale = firstZoom.zoomLevel / 100;
+          const cropW = `iw/${scale}`;
+          const cropH = `ih/${scale}`;
+          const cropX = `(iw-${cropW})*${firstZoom.position.x}/100`;
+          const cropY = `(ih-${cropH})*${firstZoom.position.y}/100`;
+          
+          ffmpegArgs.push(
+            '-vf', `crop=${cropW}:${cropH}:${cropX}:${cropY},scale=iw:ih`,
+            '-ss', firstZoom.startTime.toString(),
+            '-to', firstZoom.endTime.toString()
+          );
+        }
+        
+        // WebM settings - MUCH FASTER
         ffmpegArgs.push(
-          '-vf', `crop=${cropW}:${cropH}:${cropX}:${cropY},scale=iw:ih`,
-          '-ss', firstZoom.startTime.toString(),
-          '-to', firstZoom.endTime.toString()
+          '-c:v', 'libvpx-vp9',        // VP9 codec
+          '-crf', '30',                // Good quality, fast encoding
+          '-b:v', '1M',                // 1Mbps video bitrate
+          '-c:a', 'libopus',           // Opus audio codec
+          '-b:a', '128k',              // Audio bitrate
+          '-cpu-used', '8',            // Fastest CPU preset
+          '-deadline', 'realtime',     // Real-time encoding
+          '-y',                        // Overwrite output
+          outputFileName
+        );
+        
+      } else {
+        // MP4 format
+        outputFileName = 'output.mp4';
+        mimeType = 'video/mp4';
+        
+        // Handle trimming
+        if (trimSegments.length > 0) {
+          const { start, end } = trimSegments[0];
+          ffmpegArgs.push('-ss', start.toString(), '-to', end.toString());
+        }
+        
+        // Handle zoom effects
+        if (zoomEffects.length > 0) {
+          const firstZoom = zoomEffects[0];
+          const scale = firstZoom.zoomLevel / 100;
+          const cropW = `iw/${scale}`;
+          const cropH = `ih/${scale}`;
+          const cropX = `(iw-${cropW})*${firstZoom.position.x}/100`;
+          const cropY = `(ih-${cropH})*${firstZoom.position.y}/100`;
+          
+          ffmpegArgs.push(
+            '-vf', `crop=${cropW}:${cropH}:${cropX}:${cropY},scale=iw:ih`,
+            '-ss', firstZoom.startTime.toString(),
+            '-to', firstZoom.endTime.toString()
+          );
+        }
+        
+        // MP4 settings
+        ffmpegArgs.push(
+          '-c:v', 'libx264',           // H.264 video codec
+          '-preset', 'ultrafast',      // Fastest encoding
+          '-crf', '28',               // Good quality, fast encoding
+          '-c:a', 'aac',              // AAC audio codec
+          '-b:a', '128k',             // Audio bitrate
+          '-movflags', '+faststart',   // Web optimization
+          '-y',                       // Overwrite output
+          outputFileName
         );
       }
       
-      // SIMPLE output settings for guaranteed compatibility
-      ffmpegArgs.push(
-        '-c:v', 'libx264',           // H.264 video codec
-        '-preset', 'ultrafast',      // Fastest encoding
-        '-crf', '28',               // Good quality, fast encoding
-        '-c:a', 'aac',              // AAC audio codec
-        '-b:a', '128k',             // Audio bitrate
-        '-movflags', '+faststart',   // Web optimization
-        '-y',                       // Overwrite output
-        outputFileName
-      );
-      
-      setExportStatus('🎬 Processing video with FFmpeg...');
+      setExportStatus(`🎬 Processing ${exportFormat.toUpperCase()} with FFmpeg...`);
       setExportProgress(40);
       
       console.log('🎬 Running FFmpeg with args:', ffmpegArgs);
@@ -369,20 +424,21 @@ const VideoEditor = () => {
       
       // Read the output file
       const outputData = await ffmpegInstance.readFile(outputFileName);
-      const outputBlob = new Blob([outputData], { type: 'video/mp4' });
+      const outputBlob = new Blob([outputData], { type: mimeType });
       
       setExportStatus('💾 Preparing download...');
       setExportProgress(95);
       
       // Generate filename
       const timestamp = new Date().toISOString().slice(0, 19).replace(/[:.]/g, '-');
-      const finalFilename = `edited_${videoFileName.replace(/\.[^/.]+$/, '')}_${timestamp}.mp4`;
+      const extension = exportFormat === 'webm' ? 'webm' : 'mp4';
+      const finalFilename = `edited_${videoFileName.replace(/\.[^/.]+$/, '')}_${timestamp}.${extension}`;
       
       // Trigger download
       const downloadSuccess = triggerDownload(outputBlob, finalFilename);
       
       if (downloadSuccess) {
-        setExportStatus('✅ Export completed successfully!');
+        setExportStatus(`✅ ${exportFormat.toUpperCase()} export completed successfully!`);
         setExportProgress(100);
         
         // Clean up FFmpeg files
@@ -402,7 +458,7 @@ const VideoEditor = () => {
       const errorMessage = error.message || 'Unknown error occurred';
       setExportError(errorMessage);
       setExportStatus(`❌ Export failed: ${errorMessage}`);
-      alert(`Export failed: ${errorMessage}`);
+      alert(`Export failed: ${errorMessage}\n\nTry switching to WebM format for better compatibility.`);
     }
     
     // Reset export state after delay
@@ -428,12 +484,32 @@ const VideoEditor = () => {
       {/* Header */}
       <div className="border-b border-gray-700 p-4 flex items-center justify-between">
         <div>
-          <h1 className="text-xl font-bold">FAST Video Editor</h1>
+          <h1 className="text-xl font-bold">⚡ FAST Video Editor</h1>
           {videoFileName && (
             <p className="text-sm text-gray-400 mt-1">Editing: {videoFileName}</p>
           )}
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 items-center">
+          {/* Format Selector */}
+          <div className="flex gap-1 bg-gray-800 rounded p-1">
+            <Button
+              variant={exportFormat === 'webm' ? 'default' : 'ghost'}
+              size="sm"
+              onClick={() => setExportFormat('webm')}
+              className={`text-xs ${exportFormat === 'webm' ? 'bg-green-600' : ''}`}
+            >
+              WebM (Fast)
+            </Button>
+            <Button
+              variant={exportFormat === 'mp4' ? 'default' : 'ghost'}
+              size="sm"
+              onClick={() => setExportFormat('mp4')}
+              className={`text-xs ${exportFormat === 'mp4' ? 'bg-blue-600' : ''}`}
+            >
+              MP4 (Compatible)
+            </Button>
+          </div>
+          
           <Button
             variant="outline"
             onClick={() => fileInputRef.current?.click()}
@@ -446,10 +522,10 @@ const VideoEditor = () => {
             variant="outline"
             onClick={handleExport}
             disabled={!originalVideoFile || isExporting || isFFmpegLoading}
-            className="bg-green-600 border-green-500 hover:bg-green-700 disabled:opacity-50"
+            className={`${exportFormat === 'webm' ? 'bg-green-600 border-green-500 hover:bg-green-700' : 'bg-blue-600 border-blue-500 hover:bg-blue-700'} disabled:opacity-50`}
           >
             <Download className="w-4 h-4 mr-2" />
-            {isExporting ? `${Math.round(exportProgress)}%` : isFFmpegLoading ? 'Loading...' : 'EXPORT NOW'}
+            {isExporting ? `${Math.round(exportProgress)}%` : isFFmpegLoading ? 'Loading...' : `EXPORT ${exportFormat.toUpperCase()}`}
           </Button>
         </div>
       </div>
@@ -467,6 +543,27 @@ const VideoEditor = () => {
             currentTime={currentTime}
             duration={duration}
           />
+          
+          {/* Export Format Info */}
+          <Card className="m-4 p-4 bg-gray-700 border-gray-600">
+            <h4 className="text-sm font-medium mb-2 text-white">Export Format</h4>
+            <div className="text-xs text-gray-300 space-y-2">
+              <div className={`p-2 rounded ${exportFormat === 'webm' ? 'bg-green-900/30 border border-green-600' : 'bg-gray-600'}`}>
+                <div className="font-medium text-green-300">WebM (Recommended)</div>
+                <div>• 3-5x faster export</div>
+                <div>• VP9 + Opus codecs</div>
+                <div>• Excellent quality</div>
+                <div>• Modern browser support</div>
+              </div>
+              <div className={`p-2 rounded ${exportFormat === 'mp4' ? 'bg-blue-900/30 border border-blue-600' : 'bg-gray-600'}`}>
+                <div className="font-medium text-blue-300">MP4 (Universal)</div>
+                <div>• Slower but compatible</div>
+                <div>• H.264 + AAC codecs</div>
+                <div>• Works everywhere</div>
+                <div>• Larger file sizes</div>
+              </div>
+            </div>
+          </Card>
           
           {/* Video Info */}
           {videoFile && (
@@ -492,11 +589,11 @@ const VideoEditor = () => {
           {(isExporting || isFFmpegLoading) && (
             <Card className="m-4 p-4 bg-gray-700 border-gray-600">
               <h4 className="text-sm font-medium mb-2 text-white">
-                {isFFmpegLoading ? '📦 Loading FFmpeg' : '🎬 Export Progress'}
+                {isFFmpegLoading ? '📦 Loading FFmpeg' : `🎬 Export Progress (${exportFormat.toUpperCase()})`}
               </h4>
               <div className="w-full bg-gray-600 rounded-full h-4 mb-2">
                 <div 
-                  className="bg-green-600 h-4 rounded-full transition-all duration-300 flex items-center justify-center text-xs font-bold"
+                  className={`${exportFormat === 'webm' ? 'bg-green-600' : 'bg-blue-600'} h-4 rounded-full transition-all duration-300 flex items-center justify-center text-xs font-bold`}
                   style={{ width: `${exportProgress}%` }}
                 >
                   {exportProgress > 10 && `${Math.round(exportProgress)}%`}
@@ -504,11 +601,11 @@ const VideoEditor = () => {
               </div>
               <div className="text-xs text-gray-300">{Math.round(exportProgress)}% Complete</div>
               {exportStatus && (
-                <div className="text-xs text-green-300 mt-1">{exportStatus}</div>
+                <div className={`text-xs mt-1 ${exportFormat === 'webm' ? 'text-green-300' : 'text-blue-300'}`}>{exportStatus}</div>
               )}
               {isExporting && (
-                <div className="text-xs text-blue-300 mt-1">
-                  ⚡ Using ultrafast preset for quick export
+                <div className="text-xs text-yellow-300 mt-1">
+                  ⚡ {exportFormat === 'webm' ? 'WebM: Ultra-fast VP9 encoding' : 'MP4: H.264 encoding'}
                 </div>
               )}
             </Card>
@@ -521,7 +618,10 @@ const VideoEditor = () => {
                 <AlertCircle className="w-4 h-4" />
                 Export Error
               </h4>
-              <div className="text-xs text-red-200">{exportError}</div>
+              <div className="text-xs text-red-200 mb-2">{exportError}</div>
+              <div className="text-xs text-yellow-200 mb-2">
+                💡 Try switching to WebM format for better compatibility
+              </div>
               <Button
                 size="sm"
                 variant="outline"
@@ -530,10 +630,11 @@ const VideoEditor = () => {
                   setIsExporting(false);
                   setExportProgress(0);
                   setExportStatus('');
+                  setExportFormat('webm'); // Switch to WebM on error
                 }}
                 className="mt-2 text-xs"
               >
-                Try Again
+                Try Again with WebM
               </Button>
             </Card>
           )}
@@ -548,10 +649,10 @@ const VideoEditor = () => {
                 download={`edited_${videoFileName}`}
                 className="text-green-400 hover:text-green-300 underline text-sm block mb-2"
               >
-                🎬 Click here to download your video
+                🎬 Click here to download your {exportFormat.toUpperCase()} video
               </a>
               <div className="text-xs text-green-200">
-                MP4 video with audio exported successfully
+                {exportFormat.toUpperCase()} video with audio exported successfully
               </div>
             </Card>
           )}
@@ -559,13 +660,13 @@ const VideoEditor = () => {
           {/* Quick Export Tips */}
           {videoFile && (
             <Card className="m-4 p-3 bg-blue-900/30 border-blue-600">
-              <h4 className="text-xs font-medium mb-2 text-blue-300">⚡ Quick Export Tips</h4>
+              <h4 className="text-xs font-medium mb-2 text-blue-300">⚡ Speed Tips</h4>
               <div className="text-xs text-blue-200 space-y-1">
-                <div>• Shorter videos export much faster</div>
+                <div>• Use WebM for 3-5x faster export</div>
+                <div>• Shorter videos = faster processing</div>
                 <div>• Trim unnecessary parts first</div>
                 <div>• Simple zooms work best</div>
                 <div>• Audio is always preserved</div>
-                <div>• Uses ultrafast encoding</div>
               </div>
             </Card>
           )}
@@ -608,24 +709,30 @@ const VideoEditor = () => {
                   </div>
                 )}
                 
+                {/* Export format indicator */}
+                <div className={`absolute top-4 right-4 ${exportFormat === 'webm' ? 'bg-green-600/80' : 'bg-blue-600/80'} text-white px-2 py-1 rounded text-sm`}>
+                  Export: {exportFormat.toUpperCase()}
+                </div>
+                
                 {/* Processing overlay */}
                 {(isExporting || isFFmpegLoading) && (
                   <div className="absolute inset-0 bg-black/70 flex items-center justify-center">
                     <div className="text-white text-center max-w-md">
-                      <div className="animate-spin w-12 h-12 border-4 border-green-500 border-t-transparent rounded-full mx-auto mb-4"></div>
+                      <div className={`animate-spin w-12 h-12 border-4 ${exportFormat === 'webm' ? 'border-green-500' : 'border-blue-500'} border-t-transparent rounded-full mx-auto mb-4`}></div>
                       <p className="text-xl mb-2 font-bold">
-                        {isFFmpegLoading ? '📦 Loading FFmpeg.wasm...' : `🎬 Exporting ${Math.round(exportProgress)}%`}
+                        {isFFmpegLoading ? '📦 Loading FFmpeg.wasm...' : `🎬 Exporting ${exportFormat.toUpperCase()} ${Math.round(exportProgress)}%`}
                       </p>
                       {exportStatus && (
                         <p className="text-sm text-gray-300 mb-2">{exportStatus}</p>
                       )}
                       <p className="text-xs text-green-300">
-                        {isFFmpegLoading ? 'Preparing video processor...' : 'Creating MP4 with H.264 + AAC'}
+                        {isFFmpegLoading ? 'Trying multiple CDNs for reliability...' : 
+                         exportFormat === 'webm' ? 'Creating WebM with VP9 + Opus' : 'Creating MP4 with H.264 + AAC'}
                       </p>
                       {isExporting && (
                         <div className="mt-4 w-64 bg-gray-600 rounded-full h-2">
                           <div 
-                            className="bg-green-500 h-2 rounded-full transition-all duration-300"
+                            className={`${exportFormat === 'webm' ? 'bg-green-500' : 'bg-blue-500'} h-2 rounded-full transition-all duration-300`}
                             style={{ width: `${exportProgress}%` }}
                           ></div>
                         </div>
@@ -638,7 +745,7 @@ const VideoEditor = () => {
               <div className="text-center text-gray-400 w-full h-full flex flex-col items-center justify-center">
                 <Upload className="w-16 h-16 mx-auto mb-4 opacity-50" />
                 <p className="text-lg mb-2">Import a video file to start editing</p>
-                <p className="text-sm text-gray-500 mb-4">⚡ Fast FFmpeg.wasm processing with reliable MP4 export</p>
+                <p className="text-sm text-gray-500 mb-4">⚡ Fast FFmpeg.wasm processing with WebM/MP4 export</p>
                 <Button
                   onClick={() => fileInputRef.current?.click()}
                   className="bg-green-600 hover:bg-green-700"
