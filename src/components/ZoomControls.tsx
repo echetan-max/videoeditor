@@ -36,8 +36,6 @@ const ZoomControls: React.FC<ZoomControlsProps> = ({
 }) => {
   const selectedZoom = zoomEffects.find(z => z.id === selectedZoomId);
   const [isDragging, setIsDragging] = useState(false);
-  const [isFfmpegLoading, setIsFfmpegLoading] = useState(false);
-  const [ffmpeg, setFfmpeg] = useState<any>(null);
 
   const handleZoomLevelChange = (value: number[]) => {
     if (selectedZoom) {
@@ -90,23 +88,6 @@ const ZoomControls: React.FC<ZoomControlsProps> = ({
     return `${minutes}:${seconds.toString().padStart(2, '0')}`;
   };
 
-  const loadFfmpeg = async () => {
-    if (!ffmpeg) {
-      setIsFfmpegLoading(true);
-      // @ts-ignore
-      const { createFFmpeg } = await import('@ffmpeg/ffmpeg');
-      const ffmpegInstance = createFFmpeg({
-        log: true,
-        corePath: 'https://unpkg.com/@ffmpeg/core@0.12.4/dist/ffmpeg-core.js'
-      });
-      await ffmpegInstance.load();
-      setFfmpeg(ffmpegInstance);
-      setIsFfmpegLoading(false);
-      return ffmpegInstance;
-    }
-    return ffmpeg;
-  };
-
   return (
     <div className="p-4 space-y-6">
       <div>
@@ -120,42 +101,66 @@ const ZoomControls: React.FC<ZoomControlsProps> = ({
           Add Zoom Effect
         </Button>
 
+        {/* Performance Tips */}
+        <Card className="mb-4 p-3 bg-blue-900/30 border-blue-600">
+          <h4 className="text-xs font-medium mb-2 text-blue-300">Export Performance Tips</h4>
+          <div className="text-xs text-blue-200 space-y-1">
+            <div>• Fewer zoom effects = faster export</div>
+            <div>• Static zooms export faster than animated ones</div>
+            <div>• Shorter videos process much quicker</div>
+            <div>• Trim unnecessary parts before adding effects</div>
+          </div>
+        </Card>
+
         {/* Zoom Effects List */}
         <div className="space-y-2 mb-4">
-          {zoomEffects.map((zoom) => (
-            <div
-              key={zoom.id}
-              className={`p-3 rounded border cursor-pointer transition-colors ${
-                selectedZoomId === zoom.id
-                  ? 'bg-purple-600/30 border-purple-500'
-                  : 'bg-gray-700 border-gray-600 hover:bg-gray-600'
-              }`}
-              onClick={() => onSelectZoom(zoom.id)}
-            >
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="text-sm font-medium text-white">{zoom.name}</div>
-                  <div className="text-xs text-gray-400">
-                    {formatTime(zoom.startTime)} - {formatTime(zoom.endTime)}
+          {zoomEffects.map((zoom) => {
+            const isAnimated = zoomEffects.some(z => 
+              z.id !== zoom.id && 
+              Math.abs(z.startTime - zoom.endTime) < 0.1 && 
+              (z.zoomLevel !== zoom.zoomLevel || z.position.x !== zoom.position.x || z.position.y !== zoom.position.y)
+            );
+            
+            return (
+              <div
+                key={zoom.id}
+                className={`p-3 rounded border cursor-pointer transition-colors ${
+                  selectedZoomId === zoom.id
+                    ? 'bg-purple-600/30 border-purple-500'
+                    : 'bg-gray-700 border-gray-600 hover:bg-gray-600'
+                }`}
+                onClick={() => onSelectZoom(zoom.id)}
+              >
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-sm font-medium text-white flex items-center gap-2">
+                      {zoom.name}
+                      {isAnimated && (
+                        <span className="text-xs bg-orange-600 px-1 rounded">ANIMATED</span>
+                      )}
+                    </div>
+                    <div className="text-xs text-gray-400">
+                      {formatTime(zoom.startTime)} - {formatTime(zoom.endTime)}
+                    </div>
+                    <div className="text-xs text-gray-400">
+                      Zoom: {zoom.zoomLevel}%
+                    </div>
                   </div>
-                  <div className="text-xs text-gray-400">
-                    Zoom: {zoom.zoomLevel}%
-                  </div>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDeleteZoom(zoom.id);
+                    }}
+                    className="p-1 h-6 w-6 hover:bg-red-600"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </Button>
                 </div>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onDeleteZoom(zoom.id);
-                  }}
-                  className="p-1 h-6 w-6 hover:bg-red-600"
-                >
-                  <Trash2 className="w-3 h-3" />
-                </Button>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
 
