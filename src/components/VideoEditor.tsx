@@ -30,19 +30,40 @@ const VideoEditor = () => {
   const [exportStatus, setExportStatus] = useState('');
   const [trimSegments, setTrimSegments] = useState<{start: number, end: number}[]>([]);
   const [cutPoints, setCutPoints] = useState<number[]>([]);
+  const [ffmpeg, setFfmpeg] = useState<any>(null);
+  const [isFFmpegLoading, setIsFFmpegLoading] = useState(false);
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const previewContainerRef = useRef<HTMLDivElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const recordedChunksRef = useRef<Blob[]>([]);
 
-  // Get current active zoom effect
+  // Get current active zoom effect with smooth interpolation
   const getCurrentZoomEffect = () => {
-    return zoomEffects.find(effect => 
+    const activeEffect = zoomEffects.find(effect => 
       currentTime >= effect.startTime && currentTime <= effect.endTime
     );
+    
+    if (!activeEffect) return null;
+    
+    // Check for smooth transitions between effects
+    const nextEffect = zoomEffects.find(effect => 
+      Math.abs(effect.startTime - activeEffect.endTime) < 0.1 && effect.id !== activeEffect.id
+    );
+    
+    if (nextEffect && currentTime > activeEffect.endTime - 1) {
+      // Interpolate between current and next effect for smooth transition
+      const progress = Math.max(0, Math.min(1, (currentTime - (activeEffect.endTime - 1)) / 1));
+      return {
+        ...activeEffect,
+        zoomLevel: activeEffect.zoomLevel + (nextEffect.zoomLevel - activeEffect.zoomLevel) * progress,
+        position: {
+          x: activeEffect.position.x + (nextEffect.position.x - activeEffect.position.x) * progress,
+          y: activeEffect.position.y + (nextEffect.position.y - activeEffect.position.y) * progress
+        }
+      };
+    }
+    
+    return activeEffect;
   };
 
   useEffect(() => {
@@ -174,7 +195,103 @@ const VideoEditor = () => {
     setCutPoints(prev => [...prev, cutTime]);
   };
 
-  // Fast canvas-based export using MediaRecorder
+  // Load FFmpeg
+  const loadFFmpeg = async () => {
+    if (ffmpeg) return ffmpeg;
+    
+    setIsFFmpegLoading(true);
+    setExportStatus('Loading video processor...');
+    
+    try {
+      const { FFmpeg } = await import('@ffmpeg/ffmpeg');
+      const { fetchFile, toBlobURL } = await import('@ffmpeg/util');
+      
+      const ffmpegInstance = new FFmpeg();
+      
+      const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
+      
+      await ffmpegInstance.load({
+        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+      });
+      
+      setFfmpeg(ffmpegInstance);
+      setIsFFmpegLoading(false);
+      return ffmpegInstance;
+    } catch (error) {
+      console.error('Failed to load FFmpeg:', error);
+      setIsFFmpegLoading(false);
+      throw error;
+    }
+  };
+
+  // Build complex filter for zoom effects with smooth transitions
+  const buildZoomFilter = () => {
+    if (zoomEffects.length === 0) return '';
+    
+    // Sort effects by start time
+    const sortedEffects = [...zoomEffects].sort((a, b) => a.startTime - b.startTime);
+    
+    let filterParts = [];
+    let concatInputs = [];
+    
+    for (let i = 0; i < sortedEffects.length; i++) {
+      const effect = sortedEffects[i];
+      const nextEffect = sortedEffects[i + 1];
+      
+      const segmentEnd = nextEffect ? nextEffect.startTime : effect.endTime;
+      const segmentDuration = segmentEnd - effect.startTime;
+      
+      if (segmentDuration <= 0) continue;
+      
+      // Calculate zoom parameters
+      const zoomStart = effect.zoomLevel / 100;
+      const zoomEnd = nextEffect ? nextEffect.zoomLevel / 100 : zoomStart;
+      const posXStart = effect.position.x;
+      const posXEnd = nextEffect ? nextEffect.position.x : posXStart;
+      const posYStart = effect.position.y;
+      const posYEnd = nextEffect ? nextEffect.position.y : posYStart;
+      
+      // Create smooth interpolation expressions
+      const timeVar = `(t-${effect.startTime})`;
+      const progress = segmentDuration > 0 ? `min(1,max(0,${timeVar}/${segmentDuration}))` : '0';
+      
+      const zoomExpr = zoomStart === zoomEnd ? 
+        `${zoomStart}` : 
+        `${zoomStart}+(${zoomEnd}-${zoomStart})*${progress}`;
+      
+      const posXExpr = posXStart === posXEnd ? 
+        `${posXStart}` : 
+        `${posXStart}+(${posXEnd}-${posXStart})*${progress}`;
+      
+      const posYExpr = posYStart === posYEnd ? 
+        `${posYStart}` : 
+        `${posYStart}+(${posYEnd}-${posYStart})*${progress}`;
+      
+      // Calculate crop dimensions
+      const outW = `iw/(${zoomExpr})`;
+      const outH = `ih/(${zoomExpr})`;
+      const xExpr = `(iw-${outW})*(${posXExpr})/100`;
+      const yExpr = `(ih-${outH})*(${posYExpr})/100`;
+      
+      // Create filter for this segment
+      filterParts.push(
+        `[0:v]trim=start=${effect.startTime}:end=${segmentEnd},setpts=PTS-STARTPTS,crop=${outW}:${outH}:${xExpr}:${yExpr},scale=iw:ih[v${i}]`
+      );
+      concatInputs.push(`[v${i}]`);
+    }
+    
+    // Concatenate all segments
+    if (concatInputs.length > 1) {
+      filterParts.push(`${concatInputs.join('')}concat=n=${concatInputs.length}:v=1:a=0[outv]`);
+    } else if (concatInputs.length === 1) {
+      filterParts.push(`[v0]copy[outv]`);
+    }
+    
+    return filterParts.join(';');
+  };
+
+  // Enhanced export with proper audio handling
   const handleExport = async () => {
     if (!videoRef.current || !videoFile) {
       alert('Please import a video first');
@@ -183,187 +300,108 @@ const VideoEditor = () => {
 
     setIsExporting(true);
     setExportProgress(0);
-    setExportStatus('Preparing export...');
+    setExportStatus('Initializing export...');
 
     try {
-      const video = videoRef.current;
-      const canvas = canvasRef.current;
+      const ffmpegInstance = await loadFFmpeg();
       
-      if (!canvas) {
-        throw new Error('Canvas not available');
-      }
-
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        throw new Error('Canvas context not available');
-      }
-
-      // Set canvas size to match video
-      canvas.width = video.videoWidth || 1920;
-      canvas.height = video.videoHeight || 1080;
-
-      // Determine export range
-      let exportStart = 0;
-      let exportEnd = duration;
+      setExportStatus('Preparing video file...');
+      setExportProgress(10);
       
+      // Get video file as blob
+      const response = await fetch(videoFile);
+      const videoBlob = await response.blob();
+      const { fetchFile } = await import('@ffmpeg/util');
+      
+      const inputFileName = 'input.mp4';
+      const outputFileName = 'output.mp4';
+      
+      // Write input file
+      await ffmpegInstance.writeFile(inputFileName, await fetchFile(videoBlob));
+      
+      setExportStatus('Building filter chain...');
+      setExportProgress(20);
+      
+      let ffmpegArgs = ['-i', inputFileName];
+      
+      // Handle trim segments first
       if (trimSegments.length > 0) {
-        exportStart = trimSegments[0].start;
-        exportEnd = trimSegments[0].end;
+        const { start, end } = trimSegments[0];
+        ffmpegArgs.push('-ss', start.toString(), '-to', end.toString());
       }
-
-      const exportDuration = exportEnd - exportStart;
       
-      setExportStatus('Starting video capture...');
-      setExportProgress(5);
-
-      // Create MediaRecorder for canvas
-      const stream = canvas.captureStream(30); // 30 FPS
+      // Build zoom filter
+      const zoomFilter = buildZoomFilter();
       
-      // Add audio from video if available
-      try {
-        const audioContext = new AudioContext();
-        const source = audioContext.createMediaElementSource(video);
-        const dest = audioContext.createMediaStreamDestination();
-        source.connect(dest);
-        source.connect(audioContext.destination);
+      if (zoomFilter) {
+        setExportStatus('Applying zoom effects...');
+        setExportProgress(30);
         
-        // Combine video and audio streams
-        const audioTracks = dest.stream.getAudioTracks();
-        audioTracks.forEach(track => stream.addTrack(track));
-      } catch (audioError) {
-        console.warn('Audio capture failed, continuing with video only:', audioError);
+        ffmpegArgs.push('-filter_complex', zoomFilter);
+        ffmpegArgs.push('-map', '[outv]');
+        ffmpegArgs.push('-map', '0:a?'); // Include audio if available
+      } else {
+        // No zoom effects, just copy
+        ffmpegArgs.push('-c:v', 'libx264');
+        ffmpegArgs.push('-c:a', 'aac');
       }
-
-      recordedChunksRef.current = [];
       
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: 'video/webm;codecs=vp9,opus',
-        videoBitsPerSecond: 5000000, // 5 Mbps for good quality
+      // Output settings for high quality MP4
+      ffmpegArgs.push(
+        '-preset', 'medium',
+        '-crf', '23',
+        '-movflags', '+faststart',
+        '-y', // Overwrite output
+        outputFileName
+      );
+      
+      setExportStatus('Processing video...');
+      setExportProgress(40);
+      
+      // Set up progress monitoring
+      ffmpegInstance.on('progress', ({ progress }: { progress: number }) => {
+        const adjustedProgress = 40 + (progress * 50); // 40-90% range
+        setExportProgress(Math.min(adjustedProgress, 90));
+        setExportStatus(`Processing... ${Math.round(adjustedProgress)}%`);
       });
-
-      mediaRecorderRef.current = mediaRecorder;
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          recordedChunksRef.current.push(event.data);
-        }
-      };
-
-      mediaRecorder.onstop = () => {
-        setExportStatus('Finalizing video...');
-        setExportProgress(95);
-        
-        const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
-        
-        // Convert to MP4 if possible, otherwise use WebM
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `edited_${videoFileName.replace(/\.[^/.]+$/, '')}.webm`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-        
-        setExportProgress(100);
-        setExportStatus('Export completed!');
-        
-        setTimeout(() => {
-          setIsExporting(false);
-          setExportProgress(0);
-          setExportStatus('');
-        }, 2000);
-      };
-
-      // Start recording
-      mediaRecorder.start(100); // Collect data every 100ms
       
-      // Pause the video and seek to start
-      video.pause();
-      video.currentTime = exportStart;
+      // Run FFmpeg
+      await ffmpegInstance.exec(ffmpegArgs);
       
-      setExportStatus('Recording video...');
+      setExportStatus('Finalizing export...');
+      setExportProgress(95);
       
-      // Wait for seek to complete
-      await new Promise(resolve => {
-        const onSeeked = () => {
-          video.removeEventListener('seeked', onSeeked);
-          resolve(void 0);
-        };
-        video.addEventListener('seeked', onSeeked);
-      });
-
-      // Render frames
-      const frameRate = 30;
-      const frameInterval = 1 / frameRate;
-      let currentExportTime = exportStart;
+      // Read output file
+      const outputData = await ffmpegInstance.readFile(outputFileName);
       
-      const renderFrame = async () => {
-        if (currentExportTime >= exportEnd) {
-          mediaRecorder.stop();
-          return;
-        }
-
-        // Seek to current time
-        video.currentTime = currentExportTime;
-        
-        await new Promise(resolve => {
-          const onSeeked = () => {
-            video.removeEventListener('seeked', onSeeked);
-            resolve(void 0);
-          };
-          video.addEventListener('seeked', onSeeked);
-        });
-
-        // Clear canvas
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-        // Get current zoom effect
-        const currentZoom = zoomEffects.find(effect => 
-          currentExportTime >= effect.startTime && currentExportTime <= effect.endTime
-        );
-
-        if (currentZoom) {
-          // Apply zoom effect
-          const zoomLevel = currentZoom.zoomLevel / 100;
-          const centerX = (currentZoom.position.x / 100) * canvas.width;
-          const centerY = (currentZoom.position.y / 100) * canvas.height;
-          
-          const sourceWidth = canvas.width / zoomLevel;
-          const sourceHeight = canvas.height / zoomLevel;
-          const sourceX = centerX - sourceWidth / 2;
-          const sourceY = centerY - sourceHeight / 2;
-          
-          ctx.drawImage(
-            video,
-            Math.max(0, sourceX), Math.max(0, sourceY),
-            Math.min(sourceWidth, canvas.width - Math.max(0, sourceX)),
-            Math.min(sourceHeight, canvas.height - Math.max(0, sourceY)),
-            0, 0,
-            canvas.width, canvas.height
-          );
-        } else {
-          // No zoom, draw normally
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        }
-
-        // Update progress
-        const progress = ((currentExportTime - exportStart) / exportDuration) * 90;
-        setExportProgress(Math.min(progress + 5, 90));
-        setExportStatus(`Recording... ${Math.round(progress)}%`);
-
-        currentExportTime += frameInterval;
-        
-        // Continue to next frame
-        setTimeout(renderFrame, 1000 / frameRate);
-      };
-
-      // Start rendering
-      renderFrame();
-
+      // Create download
+      const outputBlob = new Blob([outputData], { type: 'video/mp4' });
+      const url = URL.createObjectURL(outputBlob);
+      
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `edited_${videoFileName.replace(/\.[^/.]+$/, '')}.mp4`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      
+      setExportProgress(100);
+      setExportStatus('Export completed!');
+      
+      // Clean up
+      await ffmpegInstance.deleteFile(inputFileName);
+      await ffmpegInstance.deleteFile(outputFileName);
+      
+      setTimeout(() => {
+        setIsExporting(false);
+        setExportProgress(0);
+        setExportStatus('');
+      }, 2000);
+      
     } catch (error: any) {
       console.error('Export failed:', error);
-      alert(`Export failed: ${error.message || 'Unknown error'}\n\nThis method uses canvas recording which is faster but may have compatibility issues. The video will be exported as WebM format.`);
+      alert(`Export failed: ${error.message || 'Unknown error occurred'}`);
       setIsExporting(false);
       setExportProgress(0);
       setExportStatus('');
@@ -383,7 +421,7 @@ const VideoEditor = () => {
       {/* Header */}
       <div className="border-b border-gray-700 p-4 flex items-center justify-between">
         <div>
-          <h1 className="text-xl font-bold">Fast Video Editor</h1>
+          <h1 className="text-xl font-bold">Professional Video Editor</h1>
           {videoFileName && (
             <p className="text-sm text-gray-400 mt-1">Editing: {videoFileName}</p>
           )}
@@ -400,11 +438,11 @@ const VideoEditor = () => {
           <Button
             variant="outline"
             onClick={handleExport}
-            disabled={!videoFile || isExporting}
-            className="bg-green-600 border-green-500 hover:bg-green-700"
+            disabled={!videoFile || isExporting || isFFmpegLoading}
+            className="bg-blue-600 border-blue-500 hover:bg-blue-700"
           >
             <Download className="w-4 h-4 mr-2" />
-            {isExporting ? `${exportProgress}%` : 'Fast Export'}
+            {isExporting ? `${Math.round(exportProgress)}%` : isFFmpegLoading ? 'Loading...' : 'Export MP4'}
           </Button>
         </div>
       </div>
@@ -434,46 +472,50 @@ const VideoEditor = () => {
                 <div>Zoom Effects: {zoomEffects.length}</div>
                 <div>Cut Points: {cutPoints.length}</div>
                 <div>Trim Segments: {trimSegments.length}</div>
+                {currentZoom && (
+                  <div className="text-purple-300">
+                    Active Zoom: {currentZoom.zoomLevel.toFixed(0)}%
+                  </div>
+                )}
               </div>
             </Card>
           )}
 
           {/* Export Progress */}
-          {isExporting && (
+          {(isExporting || isFFmpegLoading) && (
             <Card className="m-4 p-4 bg-gray-700 border-gray-600">
-              <h4 className="text-sm font-medium mb-2 text-white">Export Progress</h4>
+              <h4 className="text-sm font-medium mb-2 text-white">
+                {isFFmpegLoading ? 'Loading Processor' : 'Export Progress'}
+              </h4>
               <div className="w-full bg-gray-600 rounded-full h-3 mb-2">
                 <div 
-                  className="bg-green-600 h-3 rounded-full transition-all duration-300"
+                  className="bg-blue-600 h-3 rounded-full transition-all duration-300"
                   style={{ width: `${exportProgress}%` }}
                 ></div>
               </div>
-              <div className="text-xs text-gray-300">{exportProgress}% Complete</div>
+              <div className="text-xs text-gray-300">{Math.round(exportProgress)}% Complete</div>
               {exportStatus && (
-                <div className="text-xs text-green-300 mt-1">{exportStatus}</div>
+                <div className="text-xs text-blue-300 mt-1">{exportStatus}</div>
               )}
             </Card>
           )}
 
           {/* Export Info */}
           {videoFile && (
-            <Card className="m-4 p-3 bg-green-900/30 border-green-600">
-              <h4 className="text-xs font-medium mb-2 text-green-300">Fast Export Method</h4>
-              <div className="text-xs text-green-200 space-y-1">
-                <div>• Method: Canvas Recording (Fast)</div>
-                <div>• Format: WebM (Browser Native)</div>
-                <div>• Quality: High (5 Mbps)</div>
-                <div>• Frame Rate: 30 FPS</div>
-                <div>• Audio: Included when possible</div>
-                <div>• Speed: 10-50x faster than FFmpeg</div>
-                {zoomEffects.length === 0 && trimSegments.length === 0 && (
-                  <div>• Mode: Direct recording</div>
-                )}
+            <Card className="m-4 p-3 bg-blue-900/30 border-blue-600">
+              <h4 className="text-xs font-medium mb-2 text-blue-300">Export Features</h4>
+              <div className="text-xs text-blue-200 space-y-1">
+                <div>✓ High Quality MP4 Output</div>
+                <div>✓ Original Audio Preserved</div>
+                <div>✓ Smooth Zoom Transitions</div>
+                <div>✓ Professional Encoding (H.264)</div>
+                <div>✓ Fast Start for Web Playback</div>
+                <div>✓ Precise Timing Control</div>
                 {zoomEffects.length > 0 && (
-                  <div>• Mode: Zoom effects applied</div>
+                  <div>✓ {zoomEffects.length} Zoom Effect{zoomEffects.length > 1 ? 's' : ''} Applied</div>
                 )}
                 {trimSegments.length > 0 && (
-                  <div>• Mode: Trim range applied</div>
+                  <div>✓ Trim Range: {formatTime(trimSegments[0].start)} - {formatTime(trimSegments[0].end)}</div>
                 )}
               </div>
             </Card>
@@ -509,16 +551,28 @@ const VideoEditor = () => {
                   onPause={() => setIsPlaying(false)}
                   crossOrigin="anonymous"
                 />
+                
+                {/* Zoom indicator */}
+                {currentZoom && (
+                  <div className="absolute top-4 left-4 bg-purple-600/80 text-white px-2 py-1 rounded text-sm">
+                    Zoom: {currentZoom.zoomLevel.toFixed(0)}%
+                  </div>
+                )}
+                
                 {/* Processing overlay */}
-                {isExporting && (
+                {(isExporting || isFFmpegLoading) && (
                   <div className="absolute inset-0 bg-black/70 flex items-center justify-center">
                     <div className="text-white text-center">
-                      <div className="animate-spin w-8 h-8 border-2 border-green-500 border-t-transparent rounded-full mx-auto mb-2"></div>
-                      <p className="text-lg mb-1">Fast Export {exportProgress}%</p>
+                      <div className="animate-spin w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full mx-auto mb-2"></div>
+                      <p className="text-lg mb-1">
+                        {isFFmpegLoading ? 'Loading Processor...' : `Exporting ${Math.round(exportProgress)}%`}
+                      </p>
                       {exportStatus && (
                         <p className="text-sm text-gray-300">{exportStatus}</p>
                       )}
-                      <p className="text-xs text-green-300 mt-2">Using canvas recording for speed</p>
+                      <p className="text-xs text-blue-300 mt-2">
+                        {isFFmpegLoading ? 'Preparing FFmpeg...' : 'Creating high-quality MP4 with audio'}
+                      </p>
                     </div>
                   </div>
                 )}
@@ -527,10 +581,10 @@ const VideoEditor = () => {
               <div className="text-center text-gray-400 w-full h-full flex flex-col items-center justify-center">
                 <Upload className="w-16 h-16 mx-auto mb-4 opacity-50" />
                 <p className="text-lg mb-2">Import a video file to start editing</p>
-                <p className="text-sm text-gray-500 mb-4">Fast export with canvas recording</p>
+                <p className="text-sm text-gray-500 mb-4">Professional MP4 export with audio</p>
                 <Button
                   onClick={() => fileInputRef.current?.click()}
-                  className="bg-green-600 hover:bg-green-700"
+                  className="bg-blue-600 hover:bg-blue-700"
                 >
                   Choose Video File
                 </Button>
@@ -555,7 +609,7 @@ const VideoEditor = () => {
                 size="sm"
                 onClick={handlePlayPause}
                 disabled={!videoFile}
-                className="bg-green-600 hover:bg-green-700"
+                className="bg-blue-600 hover:bg-blue-700"
               >
                 {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5" />}
               </Button>
@@ -607,14 +661,6 @@ const VideoEditor = () => {
           )}
         </div>
       </div>
-
-      {/* Hidden canvas for export */}
-      <canvas 
-        ref={canvasRef} 
-        style={{ display: 'none' }}
-        width={1920}
-        height={1080}
-      />
 
       <input
         ref={fileInputRef}
