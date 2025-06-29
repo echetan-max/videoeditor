@@ -220,7 +220,7 @@ const VideoEditor = () => {
       const ffmpegInstance = await loadFfmpeg();
 
       // Progress tracking
-      ffmpegInstance.on('progress', ({ progress }) => {
+      ffmpegInstance.on('progress', ({ progress }: { progress: number }) => {
         setExportProgress(Math.round(progress * 100));
       });
 
